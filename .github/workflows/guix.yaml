@@ -1,0 +1,112 @@
+on:
+  workflow_dispatch:
+    inputs:
+      guix-binary:
+        description: url of guix binary to download
+        type: string
+        required: false
+        default: https://ftp.gnu.org/gnu/guix/guix-binary-1.3.0.x86_64-linux.tar.xz
+      verify-guix-binary:
+        description: attempt to verify via accompanying .sig file
+        type: boolean
+        required: false
+        default: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-nonguix-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and extract guix binary
+        run: |
+          wget '${{ github.event.inputs.guix-binary }}' -O guix-binary.tar.xz
+          tar -xf guix-binary.tar.xz
+          
+      - name: Verify guix binary
+        if: ${{ github.event.inputs.verify-guix-binary }}
+        run: |
+          wget '${{ github.event.inputs.guix-binary }}.sig' -O guix-binary.tar.xz.sig
+          wget 'https://sv.gnu.org/people/viewgpg.php?user_id=127547' -qO - | gpg --import -
+          gpg --verify guix-binary.tar.xz.sig
+          
+      - name: Set language
+        run: echo LANG=en_US.utf8 >> $GITHUB_ENV
+        
+      - name: Install guix
+        shell: sudo bash -eo pipefail {0}
+        run: |
+          mv var/guix /var/ && mv gnu /
+          mkdir -p /root/.config/guix
+          ln -sf /var/guix/profiles/per-user/root/current-guix /root/.config/guix/current
+          
+      - name: Create guixbuild users
+        shell: sudo bash -eo pipefail {0}
+        run: |        
+          groupadd --system guixbuild
+          for i in $(seq -w 1 10); do
+            useradd -g guixbuild -G guixbuild           \
+                    -d /var/empty -s $(which nologin)   \
+                    -c "Guix build user $i" --system    \
+                    guixbuilder$i;
+          done
+          
+      - name: Start guix daemon
+        run: |
+          sudo /root/.config/guix/current/bin/guix-daemon --build-users-group=guixbuild \
+            --substitute-urls='https://ci.guix.gnu.org https://bordeaux.guix.gnu.org https://substitutes.nonguix.org' & disown
+        
+      - name: Add guix to path
+        run: ln -sf /root/.config/guix/current/bin/guix /usr/local/bin
+        
+      - name: Enable substitutes
+        run: |
+          cat <<EOF > nonguix-signing-key.pub
+          (public-key 
+           (ecc 
+            (curve Ed25519)
+            (q #C1FD53E5D4CE971933EC50C9F307AE2171A2D3B52C804642A7A35F84F3A4EA98#)
+            )
+           )
+          EOF
+          sudo cat nonguix-signing-key.pub | sudo guix archive --authorize
+          sudo cat /root/.config/guix/current/share/guix/ci.guix.gnu.org.pub | sudo guix archive --authorize
+        
+      - name: Add nonguix channel
+        run: |
+          cat <<EOF > nonguix.scm
+          (cons* (channel
+            (name 'nonguix)
+            (url "https://gitlab.com/nonguix/nonguix")
+            ;; Enable signature verification:
+            (introduction
+             (make-channel-introduction
+              "897c1a470da759236cc11798f4e0a5f7d4d59fbc"
+              (openpgp-fingerprint
+               "2A39 3FFF 68F4 EF7A 3D29  12AF 6F51 20A0 22FB B2D5"))))
+           %default-channels)
+          EOF
+          sudo guix pull -C nonguix.scm
+        
+      - name: Build system image
+        run: |
+          sudo guix pull --list-generations
+          cat <<EOF > install.scm
+          (use-modules (gnu system)
+                       (gnu system install)
+                       (nongnu packages linux))
+
+          (operating-system
+            (inherit installation-os)
+            (kernel linux)
+            (firmware (list linux-firmware)))
+          EOF
+          ln -s $(sudo guix time-machine -C nonguix.scm -- system image -t iso9660 install.scm) nonguix-image.iso
+          
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: nonguix-image
+          path: nonguix-image.iso
